@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="CoffeeMachine.Contracts/CoffeeMachine.Contracts.csproj" />
+  <Project Path="CoffeeMachine.Emulator/CoffeeMachine.Emulator.csproj" />
+  <Project Path="CoffeeMachine.Subscriber/CoffeeMachine.Subscriber.csproj" />
+</Solution>
