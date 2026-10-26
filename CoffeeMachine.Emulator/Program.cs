@@ -106,12 +106,24 @@ while (await timer.WaitForNextTickAsync())
 
         publishingTasks.Add(
             Publish("heater-power", simulation.HeaterPower, "W"));
+
+        publishingTasks.Add(
+            Publish(
+                "brewing-active",
+                simulation.Mode == MachineMode.Brewing ? 1 : 0,
+                "bool"));
     }
 
     if (tick % 100 == 0)
     {
         publishingTasks.Add(
             Publish("water-level", simulation.WaterLevel, "%"));
+
+        publishingTasks.Add(
+            Publish(
+                "water-tank-present",
+                1,
+                "bool"));
     }
 
     await Task.WhenAll(publishingTasks);

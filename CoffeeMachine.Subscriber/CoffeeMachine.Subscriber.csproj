@@ -5,6 +5,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="InfluxDB.Client" Version="5.1.0" />
     <PackageReference Include="MQTTnet" Version="5.2.0.1603" />
   </ItemGroup>
 

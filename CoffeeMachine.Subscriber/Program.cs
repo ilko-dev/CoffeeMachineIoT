@@ -1,5 +1,9 @@
 ﻿using System.Text.Json;
 using CoffeeMachine.Contracts;
+using CoffeeMachine.Subscriber.Metrics;
+using CoffeeMachine.Subscriber.Persistence;
+using CoffeeMachine.Subscriber.Processing;
+using CoffeeMachine.Subscriber.State;
 using MQTTnet;
 using MQTTnet.Protocol;
 
@@ -7,23 +11,62 @@ var mqttFactory = new MqttClientFactory();
 
 using var mqttClient = mqttFactory.CreateMqttClient();
 
-var receivedSequences = new HashSet<long>();
-var latencies = new List<double>();
+var telemetryBuffer = new TelemetryBuffer();
+var preprocessor = new TelemetryPreprocessor();
+var synchronizationEngine = new SynchronizationEngine();
+var stateStore = new TwinStateStore();
 
-var duplicates = 0;
-var lastReportedCount = 0;
+var metrics = new PipelineMetrics();
+
+using var influxRepository =
+    new InfluxTimeSeriesRepository(
+        "http://localhost:8086",
+        "coffee-machine-local-token-2026",
+        "coffee-machine-org",
+        "coffee-machine");
 
 var qos = MqttQualityOfServiceLevel.AtLeastOnce;
 
-mqttClient.ApplicationMessageReceivedAsync += async e =>
+var hasTelemetry = false;
+var isMachineOnline = false;
+
+stateStore.StateChanged += state =>
+{
+    Console.WriteLine();
+    Console.WriteLine("========== TWIN UPDATED ==========");
+    Console.WriteLine($"Mode:              {state.Mode}");
+    Console.WriteLine($"Temperature:       {state.Temperature:F1} C");
+    Console.WriteLine($"Pressure:          {state.Pressure:F2} bar");
+    Console.WriteLine($"Average pressure:  {state.AveragePressure:F2} bar");
+    Console.WriteLine($"Flow rate:         {state.FlowRate:F2} ml/s");
+    Console.WriteLine($"Average flow:      {state.AverageFlowRate:F2} ml/s");
+    Console.WriteLine($"Water level:       {state.WaterLevel:F1} %");
+    Console.WriteLine($"Heater power:      {state.HeaterPower:F0} W");
+    Console.WriteLine($"Vibration:         {state.PumpVibration:F2} m/s2");
+    Console.WriteLine($"Brewing:           {state.BrewingActive}");
+    Console.WriteLine($"Tank present:      {state.WaterTankPresent}");
+    Console.WriteLine($"Water low:         {state.IsWaterLow}");
+    Console.WriteLine($"Updated:           {state.LastUpdated:HH:mm:ss.fff}");
+    Console.WriteLine("==================================");
+    Console.WriteLine();
+};
+
+
+// MQTT callback
+mqttClient.ApplicationMessageReceivedAsync += e =>
 {
     var topic = e.ApplicationMessage.Topic;
     var payload = e.ApplicationMessage.ConvertPayloadToString();
 
     if (topic.EndsWith("/status"))
     {
+        isMachineOnline = payload.Equals(
+            "online",
+             StringComparison.OrdinalIgnoreCase);
+
         Console.WriteLine($"STATUS -> {payload}");
-        return;
+
+        return Task.CompletedTask;
     }
 
     try
@@ -31,67 +74,15 @@ mqttClient.ApplicationMessageReceivedAsync += async e =>
         var telemetry =
             JsonSerializer.Deserialize<TelemetryMessage>(payload);
 
-        if (telemetry is null || !IsValid(telemetry))
+        if (telemetry is null ||
+            !IsStructurallyValid(telemetry))
         {
             Console.WriteLine($"INVALID [{topic}]");
-            return;
+
+            return Task.CompletedTask;
         }
 
-        var latency =
-            DateTimeOffset.UtcNow - telemetry.Timestamp;
-
-        if (!receivedSequences.Add(telemetry.Sequence))
-        {
-            duplicates++;
-        }
-
-        latencies.Add(latency.TotalMilliseconds);
-
-        Console.WriteLine(
-            $"RECV [{telemetry.SensorId}] " +
-            $"{telemetry.Value} {telemetry.Unit} | " +
-            $"seq={telemetry.Sequence} | " +
-            $"latency={latency.TotalMilliseconds:F1} ms");
-
-        var logLine =
-            $"{DateTimeOffset.Now:O};" +
-            $"{telemetry.MachineId};" +
-            $"{telemetry.SensorId};" +
-            $"{telemetry.Value};" +
-            $"{telemetry.Unit};" +
-            $"{telemetry.Sequence};" +
-            $"{latency.TotalMilliseconds:F1}";
-
-        if (receivedSequences.Count >= lastReportedCount + 500)
-        {
-            lastReportedCount = receivedSequences.Count;
-
-            var minSequence = receivedSequences.Min();
-            var maxSequence = receivedSequences.Max();
-
-            var expected = maxSequence - minSequence + 1;
-            var received = receivedSequences.Count;
-            var lost = expected - received;
-
-            var stats =
-                $"QoS={qos}; " +
-                $"Received={received}; " +
-                $"Lost={lost}; " +
-                $"Duplicates={duplicates}; " +
-                $"AvgLatency={latencies.Average():F2}ms; " +
-                $"MaxLatency={latencies.Max():F2}ms";
-
-            Console.WriteLine();
-            Console.WriteLine($"STATS -> {stats}");
-
-            await File.AppendAllTextAsync(
-                "qos-results.log",
-                $"{DateTimeOffset.Now:O}; {stats}{Environment.NewLine}");
-        }
-
-        await File.AppendAllTextAsync(
-            "telemetry.log",
-            logLine + Environment.NewLine);
+        telemetryBuffer.Add(telemetry);
     }
     catch (JsonException)
     {
@@ -99,9 +90,11 @@ mqttClient.ApplicationMessageReceivedAsync += async e =>
             $"INVALID JSON [{topic}]: {payload}");
     }
 
-    return;
+    return Task.CompletedTask;
 };
 
+
+// MQTT connection
 var options = new MqttClientOptionsBuilder()
     .WithClientId("coffee-machine-subscriber")
     .WithTcpServer("localhost", 1883)
@@ -111,6 +104,8 @@ await mqttClient.ConnectAsync(
     options,
     CancellationToken.None);
 
+
+// Subscribe
 var subscribeOptions = mqttFactory
     .CreateSubscribeOptionsBuilder()
     .WithTopicFilter(
@@ -126,19 +121,126 @@ await mqttClient.SubscribeAsync(
     CancellationToken.None);
 
 Console.WriteLine("Subscriber connected.");
-Console.WriteLine("Waiting for telemetry...");
+Console.WriteLine("Digital twin pipeline started.");
+Console.WriteLine();
 
-await Task.Delay(Timeout.Infinite);
 
-static bool IsValid(TelemetryMessage message)
+using var processingTimer =
+    new PeriodicTimer(
+        TimeSpan.FromMilliseconds(100));
+
+var lastMetricsOutput =
+    DateTimeOffset.UtcNow;
+
+while (await processingTimer.WaitForNextTickAsync())
 {
-    if (string.IsNullOrWhiteSpace(message.MachineId))
+    var readyBefore =
+        DateTimeOffset.UtcNow.AddMilliseconds(-200);
+
+    var messages =
+        telemetryBuffer.GetReadyMessages(readyBefore);
+
+    var processedAny = false;
+
+    DateTimeOffset? latestTelemetryTimestamp = null;
+
+    // Preprocessing
+    foreach (var telemetry in messages)
+    {
+        if (!preprocessor.TryProcess(
+                telemetry,
+                out var error))
+        {
+            Console.WriteLine(
+                $"REJECTED: {error}");
+
+            continue;
+        }
+
+        metrics.RecordProcessedMessage();
+
+        processedAny = true;
+
+        latestTelemetryTimestamp =
+            telemetry.Timestamp;
+
+
+        await influxRepository.WriteTelemetryAsync(telemetry);
+
+        hasTelemetry = true;
+    }
+
+    if (!hasTelemetry || !isMachineOnline || !processedAny)
+        continue;
+
+    var candidateState =
+        preprocessor.CreateSnapshot();
+
+    if (!synchronizationEngine.ShouldSynchronize(
+            candidateState,
+            out var reason))
+    {
+        continue;
+    }
+
+
+    stateStore.Update(candidateState);
+
+    var currentState =
+        stateStore.CurrentState;
+
+    synchronizationEngine.MarkSynchronized(
+        currentState);
+
+    metrics.RecordSynchronization(
+        latestTelemetryTimestamp!.Value,
+        currentState.LastUpdated);
+
+    await influxRepository
+        .WriteTwinStateAsync(
+            currentState,
+            reason);
+
+    Console.WriteLine(
+        $"Synchronization reason: {reason}");
+
+    if (DateTimeOffset.UtcNow - lastMetricsOutput >= TimeSpan.FromSeconds(5))
+    {
+        Console.WriteLine();
+        Console.WriteLine("========== METRICS ==========");
+        Console.WriteLine(
+            $"Processed:      {metrics.ProcessedMessages}");
+
+        Console.WriteLine(
+            $"Synchronizations: {metrics.Synchronizations}");
+
+        Console.WriteLine(
+            $"Avg latency:    {metrics.AverageLatencyMs:F2} ms");
+
+        Console.WriteLine(
+            $"Max latency:    {metrics.MaxLatencyMs:F2} ms");
+
+        Console.WriteLine(
+            $"Throughput:     {metrics.Throughput:F2} msg/s");
+
+        Console.WriteLine("=============================");
+        Console.WriteLine();
+
+        lastMetricsOutput =
+            DateTimeOffset.UtcNow;
+    }
+}
+
+
+static bool IsStructurallyValid(
+    TelemetryMessage message)
+{
+    if (string.IsNullOrWhiteSpace(
+            message.MachineId))
         return false;
 
-    if (string.IsNullOrWhiteSpace(message.SensorId))
-        return false;
-
-    if (string.IsNullOrWhiteSpace(message.Unit))
+    if (string.IsNullOrWhiteSpace(
+            message.SensorId))
         return false;
 
     if (message.Timestamp == default)
